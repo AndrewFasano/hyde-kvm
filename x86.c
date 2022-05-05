@@ -1735,6 +1735,11 @@ static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	efer &= ~EFER_LMA;
 	efer |= vcpu->arch.efer & EFER_LMA;
 
+	// HyDE: disable SCE so we can emulate syscall/sysret
+	if (efer & EFER_SCE) {
+		efer &= ~EFER_SCE;
+	}
+
 	r = static_call(kvm_x86_set_efer)(vcpu, efer);
 	if (r) {
 		WARN_ON(r > 0);
@@ -8537,6 +8542,10 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
 	 * and the address again, we can break out of the potential infinite
 	 * loop.
 	 */
+
+	// TODO: could we do our HyDE fualt here if we returned retry in emulate.c
+	// and set some shared state? Then maybe we could retry after trapping to host?
+
 	vcpu->arch.last_retry_eip = vcpu->arch.last_retry_addr = 0;
 
 	if (!(emulation_type & EMULTYPE_ALLOW_RETRY_PF))
@@ -10231,6 +10240,8 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
  * exiting to the userspace.  Otherwise, the value will be returned to the
  * userspace.
  */
+extern bool is_syscall;
+
 static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 {
 	int r;
@@ -10297,8 +10308,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			kvm_vcpu_flush_tlb_guest(vcpu);
 
 		if (kvm_check_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu)) {
-			vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
-			r = 0;
+			if (is_syscall) { // Sanity check. This is equivalent to original behavior for now
+				is_syscall = false;
+				vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
+				r = 0;
+			}else{
+				vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
+				r = 0;
+			}
 			goto out;
 		}
 		if (kvm_test_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
@@ -10690,6 +10707,7 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
 /* Called within kvm->srcu read side.  */
 static int vcpu_run(struct kvm_vcpu *vcpu)
 {
+	// called by kvm_arch_vcpu_ioctl_run in emulation loop
 	int r;
 
 	vcpu->arch.l1tf_flush_l1d = true;
@@ -10703,7 +10721,7 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
 		 */
 		vcpu->arch.at_instruction_boundary = false;
 		if (kvm_vcpu_running(vcpu)) {
-			r = vcpu_enter_guest(vcpu);
+			r = vcpu_enter_guest(vcpu); // This is where we check for the is_syscall
 		} else {
 			r = vcpu_block(vcpu);
 		}
@@ -10831,6 +10849,7 @@ static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
 
 int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 {
+	// Main function run by kvm_main in a loop for each VM_RUN ioctl issued by userspace
 	struct kvm_queued_exception *ex = &vcpu->arch.exception;
 	struct kvm_run *kvm_run = vcpu->run;
 	int r;
@@ -10922,9 +10941,10 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 
 	r = static_call(kvm_x86_vcpu_pre_run)(vcpu);
 	if (r <= 0)
-		goto out;
+		goto out; /* HyDE XXX: if this bails on emulated syscall injection we'll have problems */
 
-	r = vcpu_run(vcpu);
+	r = vcpu_run(vcpu); // This is the main emu call which eventually checks for is_syscall
+		                    // vcpu_run -> vcpu_enter_guest
 
 out:
 	kvm_put_guest_fpu(vcpu);
