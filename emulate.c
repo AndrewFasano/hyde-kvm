@@ -2398,7 +2398,7 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
 	bool hyde_syscall = false;
-	u64 rip;
+	u64 rip = ctxt->_eip; // This is important (it's next PC): we pass it to qemu which gives it to capabilities
 
 	/* syscall is not available in real mode */
 	if (ctxt->mode == X86EMUL_MODE_REAL ||
