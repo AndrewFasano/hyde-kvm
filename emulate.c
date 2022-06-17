@@ -2399,6 +2399,10 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	u64 efer = 0;
 	bool hyde_syscall = false;
 	u64 rip = ctxt->_eip; // This is important (it's next PC): we pass it to qemu which gives it to capabilities
+	unsigned long int orig_rcx;
+#ifdef CONFIG_X86_64
+		unsigned long int orig_r11;
+#endif
 
 	/* syscall is not available in real mode */
 	if (ctxt->mode == X86EMUL_MODE_REAL ||
@@ -2425,9 +2429,11 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	ops->set_segment(ctxt, cs_sel, &cs, 0, VCPU_SREG_CS);
 	ops->set_segment(ctxt, ss_sel, &ss, 0, VCPU_SREG_SS);
 
+	orig_rcx = reg_read(ctxt, VCPU_REGS_RCX);
 	*reg_write(ctxt, VCPU_REGS_RCX) = ctxt->_eip;
 	if (efer & EFER_LMA) {
 #ifdef CONFIG_X86_64
+		orig_r11 = reg_read(ctxt, VCPU_REGS_R11);
 		*reg_write(ctxt, VCPU_REGS_R11) = ctxt->eflags;
 		ops->get_msr(ctxt,
 			     ctxt->mode == X86EMUL_MODE_PROT64 ?
@@ -2462,7 +2468,10 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		vcpu->run->papr_hcall.args[0] = rip;
 		vcpu->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
 		vcpu->run->papr_hcall.args[2] = 1; // is_syscall (vs sysret)
-
+    vcpu->run->papr_hcall.args[3] = orig_rcx;
+#ifdef CONFIG_X86_64
+    vcpu->run->papr_hcall.args[4] = orig_r11;
+#endif
 	}
 	return X86EMUL_CONTINUE;
 }
