@@ -310,6 +310,9 @@ u64 __read_mostly host_xcr0;
 
 static struct kmem_cache *x86_emulator_cache;
 
+static bool __read_mostly hyde_enabled = false;
+static bool __read_mostly pre_hyde_efer_sce = false;
+
 /*
  * When called, it means the previous get/set msr reached an invalid msr.
  * Return true if we want to ignore/silent this failed msr access.
@@ -1735,9 +1738,24 @@ static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	efer &= ~EFER_LMA;
 	efer |= vcpu->arch.efer & EFER_LMA;
 
-	// HyDE: disable SCE so we can emulate syscall/sysret
+	// If HyDE is enabled, we don't let the guest set the SCE bit. When this
+	// bit is unset, we'll trap on undefined instruction when we hit syscall/sysret
+	// allowing us to emulate those instructions but also to coopt them with HyDE.
+	// If HyDE is disabled, we keep track of the state of the SCE flag so we can
+	// ensure it gets set to its old value after HyDE finishes. If we get this
+	// wrong, the guest will run slower than it should, but it shouldn't crash.
+
 	if (efer & EFER_SCE) {
-		efer &= ~EFER_SCE;
+		// Guest wants to set SCE bit. If HyDe enabled, we block it
+		if (hyde_enabled) {
+			efer &= ~EFER_SCE;
+		} else {
+			// If HyDE disabled we record that SCE was set
+			pre_hyde_efer_sce = true;
+		}
+	} else if (!hyde_enabled) {
+		// Guest doesn't want to set SCE bit. If HyDE disabled, record this
+		pre_hyde_efer_sce = false;
 	}
 
 	r = static_call(kvm_x86_set_efer)(vcpu, efer);
@@ -5560,6 +5578,27 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 	u.buffer = NULL;
 	switch (ioctl) {
+	// This should be defined in include/uapi/linux/kvm.h
+	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
+		case KVM_HYDE_TOGGLE: {
+			hyde_enabled = (bool)arg;
+			if (pre_hyde_efer_sce) {
+				u64 efer = vcpu->arch.efer;
+				if (hyde_enabled) {
+					// We just enabled hyde and the SCE bit was previously set so we need to disable it
+					efer &= ~EFER_SCE;
+				} else {
+					// We just disabled hyde, but we previously had SCE on. Turn it back on!
+					efer |= EFER_SCE;
+				}
+				r = static_call(kvm_x86_set_efer)(vcpu, efer);
+				if (r) {
+					WARN_ON(r > 0);
+				}
+			}
+		r = 0;
+		break;
+	}
 	case KVM_GET_LAPIC: {
 		r = -EINVAL;
 		if (!lapic_in_kernel(vcpu))
