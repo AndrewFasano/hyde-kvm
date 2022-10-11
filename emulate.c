@@ -2388,8 +2388,6 @@ static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
 	return false;
 }
 
-bool is_syscall = false; // Misnomer: is there an active syscall/sysret that hasn't been passed to userspace yet?
-
 static int em_syscall(struct x86_emulate_ctxt *ctxt)
 {
 	const struct x86_emulate_ops *ops = ctxt->ops;
@@ -2397,7 +2395,6 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	u64 msr_data;
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
-	bool hyde_syscall = false;
 	u64 rip = ctxt->_eip; // This is important (it's next PC): we pass it to qemu which gives it to capabilities
 	unsigned long int orig_rcx;
 #ifdef CONFIG_X86_64
@@ -2413,8 +2410,6 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		return emulate_ud(ctxt);
 
 	ops->get_msr(ctxt, MSR_EFER, &efer);
-	if (!(efer & EFER_SCE))
-		hyde_syscall = true;
 
 	setup_syscalls_segments(&cs, &ss);
 	ops->get_msr(ctxt, MSR_STAR, &msr_data);
@@ -2453,14 +2448,12 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	}
 
 	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
-	if (hyde_syscall) {
+	if (!(efer & EFER_SCE)) { // This should always be true?
 		struct kvm_vcpu *vcpu = ctxt->vcpu;
 		// Inform userspace that a syscall has happened
 		// We make this request here and then x86.c will detect it at :9709.
-		// The is_syscall bool is just a sanity check that we should later remove
 		// Note that QEMU KVM used to ignore the TPR_ACCESS error, so that's why we co-opted it
 		kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
-		is_syscall = true;
 		// We store information in vcpu->run which is shared with userspace
 
 		// For every syscall we provide sysno, pc, asid, direction
@@ -2472,7 +2465,9 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 #ifdef CONFIG_X86_64
     vcpu->run->papr_hcall.args[4] = orig_r11;
 #endif
-	}
+	}else {
+    printk_once(KERN_WARNING "kvm: emulated syscall when SCE bit is set. Impossible?\n");
+  }
 	return X86EMUL_CONTINUE;
 }
 
@@ -2542,7 +2537,6 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
   if (hyde_sysret) {
     struct kvm_vcpu *vcpu = ctxt->vcpu;
 	  kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
-    is_syscall = true; // Bad name, just for debugging
     // We store information in vcpu->run which is shared with userspace
     // For every syscall we provide sysno, pc, asid, direction
     vcpu->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval

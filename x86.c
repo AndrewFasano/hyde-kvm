@@ -310,8 +310,8 @@ u64 __read_mostly host_xcr0;
 
 static struct kmem_cache *x86_emulator_cache;
 
-static bool __read_mostly hyde_enabled = false;
-static bool __read_mostly pre_hyde_efer_sce = false;
+bool __read_mostly hyde_enabled = false;
+bool __read_mostly pre_hyde_efer_sce = false;
 
 /*
  * When called, it means the previous get/set msr reached an invalid msr.
@@ -5581,6 +5581,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 	// This should be defined in include/uapi/linux/kvm.h
 	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
 		case KVM_HYDE_TOGGLE: {
+			printk(KERN_ERR "hyde: Lets toggle hyde from %d to %d\n", hyde_enabled, (bool)arg);
 			hyde_enabled = (bool)arg;
 			if (pre_hyde_efer_sce) {
 				u64 efer = vcpu->arch.efer;
@@ -5591,10 +5592,17 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 					// We just disabled hyde, but we previously had SCE on. Turn it back on!
 					efer |= EFER_SCE;
 				}
+				//printk(KERN_ERR "hyde: Lets kick\n");
+				//kvm_vcpu_kick(vcpu);
+				printk(KERN_ERR "hyde: Fin kick, set efer\n");
+				// Kick CPU
 				r = static_call(kvm_x86_set_efer)(vcpu, efer);
 				if (r) {
 					WARN_ON(r > 0);
 				}
+				printk(KERN_ERR "hyde: All done\n");
+			}else{
+				printk(KERN_ERR "hyde: no need to change efer\n");
 			}
 		r = 0;
 		break;
@@ -10279,8 +10287,6 @@ EXPORT_SYMBOL_GPL(__kvm_request_immediate_exit);
  * exiting to the userspace.  Otherwise, the value will be returned to the
  * userspace.
  */
-extern bool is_syscall;
-
 static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 {
 	int r;
@@ -10347,14 +10353,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			kvm_vcpu_flush_tlb_guest(vcpu);
 
 		if (kvm_check_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu)) {
-			if (is_syscall) { // Sanity check. This is equivalent to original behavior for now
-				is_syscall = false;
-				vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
-				r = 0;
-			}else{
-				vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
-				r = 0;
-			}
+			//assert(is_syscall);
+			vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
+			r = 0;
 			goto out;
 		}
 		if (kvm_test_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
@@ -12179,6 +12180,11 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 	ret = static_call(kvm_x86_vm_init)(kvm);
 	if (ret)
 		goto out_uninit_mmu;
+
+	// XXX should make this per-vcpu or per guest system
+	printk(KERN_INFO "HyDE init, disable opts\n");
+	hyde_enabled = false;
+	pre_hyde_efer_sce = false;
 
 	INIT_HLIST_HEAD(&kvm->arch.mask_notifier_list);
 	INIT_LIST_HEAD(&kvm->arch.assigned_dev_head);
