@@ -5579,7 +5579,10 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 	u.buffer = NULL;
 	switch (ioctl) {
 	// This should be defined in include/uapi/linux/kvm.h
+  // But to keep our patches isolated, we can just define it here and add
+  // a matching def to qemu
 	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
+#define KVM_HYDE_TOGGLE 0x8001aebb
 		case KVM_HYDE_TOGGLE: {
 			printk(KERN_ERR "hyde: Lets toggle hyde from %d to %d\n", hyde_enabled, (bool)arg);
 			hyde_enabled = (bool)arg;
