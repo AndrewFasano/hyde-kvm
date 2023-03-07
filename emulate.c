@@ -2500,7 +2500,7 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
 		return emulate_gp(ctxt,0);
 	}
 	ops->get_msr(ctxt, MSR_EFER, &efer);
-	setup_syscalls_segments(ctxt, &cs, &ss);
+	setup_syscalls_segments(&cs, &ss);
 
 	if (!(efer & EFER_SCE))
 		hyde_sysret = true;
