@@ -314,6 +314,29 @@ bool __read_mostly hyde_enabled = false;
 bool __read_mostly pre_hyde_efer_sce = false;
 
 /*
+ * A client is potentially modifying the EFER register. We need to examine how the SCE bit is set
+ * and if HyDE is enabled. Together with this info, we update pre_hyde_efer_sce.
+ * If HyDE is enabled, we prohibit the SCE bit from being set
+ */
+__u64 attempt_efer_update(__u64 efer) {
+    printk(KERN_INFO "HyDE enabled=%d, SCE=%d\n", hyde_enabled, (bool)(efer & EFER_SCE));
+	if (efer & EFER_SCE) {
+		// Guest wants to set SCE bit. If HyDe enabled, we block it
+		if (hyde_enabled) {
+			efer &= ~EFER_SCE;
+		} else {
+			// If HyDE disabled we record that SCE was set
+			pre_hyde_efer_sce = true;
+		}
+	} else if (!hyde_enabled) {
+		// Guest doesn't want to set SCE bit. If HyDE disabled, record this
+		pre_hyde_efer_sce = false;
+	}
+	return efer;
+}
+
+
+/*
  * When called, it means the previous get/set msr reached an invalid msr.
  * Return true if we want to ignore/silent this failed msr access.
  */
@@ -1744,19 +1767,7 @@ static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	// If HyDE is disabled, we keep track of the state of the SCE flag so we can
 	// ensure it gets set to its old value after HyDE finishes. If we get this
 	// wrong, the guest will run slower than it should, but it shouldn't crash.
-
-	if (efer & EFER_SCE) {
-		// Guest wants to set SCE bit. If HyDe enabled, we block it
-		if (hyde_enabled) {
-			efer &= ~EFER_SCE;
-		} else {
-			// If HyDE disabled we record that SCE was set
-			pre_hyde_efer_sce = true;
-		}
-	} else if (!hyde_enabled) {
-		// Guest doesn't want to set SCE bit. If HyDE disabled, record this
-		pre_hyde_efer_sce = false;
-	}
+	efer = attempt_efer_update(efer);
 
 	r = static_call(kvm_x86_set_efer)(vcpu, efer);
 	if (r) {
@@ -4120,7 +4131,7 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		msr_info->data |= (((uint64_t)4ULL) << 40);
 		break;
 	case MSR_EFER:
-		msr_info->data = vcpu->arch.efer;
+		msr_info->data = vcpu->arch.efer; /* HyDE TODO: should we hide the SCE bit we changed? */
 		break;
 	case MSR_KVM_WALL_CLOCK:
 		if (!guest_pv_has(vcpu, KVM_FEATURE_CLOCKSOURCE))
@@ -11391,6 +11402,8 @@ static int __set_sregs2(struct kvm_vcpu *vcpu, struct kvm_sregs2 *sregs2)
 
 	if (valid_pdptrs && (!pae || vcpu->arch.guest_state_protected))
 		return -EINVAL;
+
+	sregs2->efer = attempt_efer_update(sregs2->efer);
 
 	ret = __set_sregs_common(vcpu, (struct kvm_sregs *)sregs2,
 				 &mmu_reset_needed, !valid_pdptrs);
