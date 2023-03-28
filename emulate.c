@@ -18,6 +18,9 @@
  * From: xen-unstable 10676:af9809f51f81a3c43f276f00c81a52ef558afda4
  */
 
+ // For performance testing - do we tell userspace about syscalls?
+ //#define PASS_SYSCALLS_TO_USERSPACE
+
 #include <linux/kvm_host.h>
 #include "kvm_cache_regs.h"
 #include "kvm_emulate.h"
@@ -2388,6 +2391,8 @@ static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
 	return false;
 }
 
+
+#define KVM_VCPU(ctxt) ((struct kvm_vcpu *)ctxt->vcpu)
 static int em_syscall(struct x86_emulate_ctxt *ctxt)
 {
 	const struct x86_emulate_ops *ops = ctxt->ops;
@@ -2395,41 +2400,58 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	u64 msr_data;
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
+	int mode = ctxt->mode;
+	bool is_lma;
+#ifdef PASS_SYSCALLS_TO_USERSPACE
 	u64 rip = ctxt->_eip; // next PC - passed to qemu
 	unsigned long int orig_rcx;
 #ifdef CONFIG_X86_64
 	unsigned long int orig_r11;
 #endif
+#endif
 
 	/* syscall is not available in real mode */
-	if (ctxt->mode == X86EMUL_MODE_REAL ||
-	    ctxt->mode == X86EMUL_MODE_VM86)
+	if (unlikely(mode == X86EMUL_MODE_REAL ||
+				 mode == X86EMUL_MODE_VM86))
 		return emulate_ud(ctxt);
-	if (!(em_syscall_is_enabled(ctxt)))
+
+	if (unlikely(!em_syscall_is_enabled(ctxt)))
 		return emulate_ud(ctxt);
+
 	ops->get_msr(ctxt, MSR_EFER, &efer);
+	//if (unlikely(!(efer & EFER_SCE)))
+	//	return emulate_ud(ctxt);
 
 	setup_syscalls_segments(&cs, &ss);
+
 	ops->get_msr(ctxt, MSR_STAR, &msr_data);
 	msr_data >>= 32;
 	cs_sel = (u16)(msr_data & 0xfffc);
 	ss_sel = (u16)(msr_data + 8);
-	if (efer & EFER_LMA) {
+
+	is_lma = efer & EFER_LMA;
+	if (is_lma) {
 		cs.d = 0;
 		cs.l = 1;
 	}
+
 	ops->set_segment(ctxt, cs_sel, &cs, 0, VCPU_SREG_CS);
 	ops->set_segment(ctxt, ss_sel, &ss, 0, VCPU_SREG_SS);
 
-	orig_rcx = reg_read(ctxt, VCPU_REGS_RCX);
+#ifdef PASS_SYSCALLS_TO_USERSPACE
+	orig_rcx = reg_read(ctxt, VCPU_REGS_RCX); // Save orig RCX
+#endif
 	*reg_write(ctxt, VCPU_REGS_RCX) = ctxt->_eip;
-	if (efer & EFER_LMA) {
+
+	if (is_lma) {
 #ifdef CONFIG_X86_64
-		orig_r11 = reg_read(ctxt, VCPU_REGS_R11);
+#ifdef PASS_SYSCALLS_TO_USERSPACE
+		orig_r11 = reg_read(ctxt, VCPU_REGS_R11); // Save orig R11
+#endif
 		*reg_write(ctxt, VCPU_REGS_R11) = ctxt->eflags;
 		ops->get_msr(ctxt,
-			     ctxt->mode == X86EMUL_MODE_PROT64 ?
-			     MSR_LSTAR : MSR_CSTAR, &msr_data);
+				mode == X86EMUL_MODE_PROT64 ?
+				MSR_LSTAR : MSR_CSTAR, &msr_data);
 		ctxt->_eip = msr_data;
 		ops->get_msr(ctxt, MSR_SYSCALL_MASK, &msr_data);
 		ctxt->eflags &= ~msr_data;
@@ -2441,29 +2463,27 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		ctxt->_eip = (u32)msr_data;
 		ctxt->eflags &= ~(X86_EFLAGS_VM | X86_EFLAGS_IF);
 	}
+
 	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
 
+#ifdef PASS_SYSCALLS_TO_USERSPACE
+	//struct kvm_vcpu *vcpu = ctxt->vcpu;
+	// Inform userspace that a syscall has happened
+	// We make this request here and then x86.c will detect it at :9709.
+	// Note that QEMU KVM used to ignore the TPR_ACCESS error, so that's why we co-opted it
+	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
+	// We store information in vcpu->run which is shared with userspace
 
-	if (!(efer & EFER_SCE)) { // This should always be true?
-		struct kvm_vcpu *vcpu = ctxt->vcpu;
-		// Inform userspace that a syscall has happened
-		// We make this request here and then x86.c will detect it at :9709.
-		// Note that QEMU KVM used to ignore the TPR_ACCESS error, so that's why we co-opted it
-		kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
-		// We store information in vcpu->run which is shared with userspace
-
-		// For every syscall we provide sysno, pc, asid, direction
-		vcpu->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX);
-		vcpu->run->papr_hcall.args[0] = rip;
-		vcpu->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
-		vcpu->run->papr_hcall.args[2] = 1; // is_syscall (vs sysret)
-		vcpu->run->papr_hcall.args[3] = orig_rcx;
+	// For every syscall we provide sysno, pc, asid, direction
+	KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX);
+	KVM_VCPU(ctxt)->run->papr_hcall.args[0] = rip;
+	KVM_VCPU(ctxt)->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
+	KVM_VCPU(ctxt)->run->papr_hcall.args[2] = 1; // is_syscall (vs sysret)
+	KVM_VCPU(ctxt)->run->papr_hcall.args[3] = orig_rcx;
 #ifdef CONFIG_X86_64
-		vcpu->run->papr_hcall.args[4] = orig_r11;
+	KVM_VCPU(ctxt)->run->papr_hcall.args[4] = orig_r11;
 #endif
-	} else {
-		printk_once(KERN_WARNING "kvm: emulated syscall when SCE bit is set. Impossible?\n");
-	}
+#endif
 
 	return X86EMUL_CONTINUE;
 }
@@ -2472,54 +2492,57 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
 {
 	// Function based off kvm-vmi/nitro code from
 	// https://github.com/KVM-VMI/kvm/blob/master/arch/x86/kvm/emulate.c#L2693
+	// Slight optimizations from GPT4
+
 	const struct x86_emulate_ops *ops = ctxt->ops;
 	struct desc_struct cs, ss;
 	u64 msr_data, rcx;
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
-	bool hyde_sysret = false;
+	int mode = ctxt->mode;
 	//struct kvm_vcpu *vcpu = container_of(ctxt, struct kvm_vcpu, arch.emulate_ctxt);
+
 	/* syscall is not available in real mode */
-	if (ctxt->mode == X86EMUL_MODE_REAL ||
-	    ctxt->mode == X86EMUL_MODE_VM86)
+	if (unlikely(mode == X86EMUL_MODE_REAL ||
+				 mode == X86EMUL_MODE_VM86))
 		return emulate_ud(ctxt);
-	if (!(em_syscall_is_enabled(ctxt)))
+	if (unlikely(!em_syscall_is_enabled(ctxt)))
 		return emulate_ud(ctxt);
 
-	if(ctxt->ops->cpl(ctxt) != 0){
-		return emulate_gp(ctxt,0);
+	if (unlikely(ctxt->ops->cpl(ctxt) != 0)) {
+		return emulate_gp(ctxt, 0);
 	}
 
 	//check if RCX is in canonical form
 	rcx = reg_read(ctxt, VCPU_REGS_RCX);
-	if(( (rcx & 0xFFFF800000000000) != 0xFFFF800000000000) &&
-	  ( (rcx & 0x00007FFFFFFFFFFF) != rcx)){
-		return emulate_gp(ctxt,0);
+	if (((rcx & 0xFFFF800000000000) != 0xFFFF800000000000) &&
+	    ((rcx & 0x00007FFFFFFFFFFF) != rcx)) {
+		return emulate_gp(ctxt, 0);
 	}
+
 	ops->get_msr(ctxt, MSR_EFER, &efer);
 	setup_syscalls_segments(&cs, &ss);
 
-	if (!(efer & EFER_SCE))
-		hyde_sysret = true;
+	//if (!(efer & EFER_SCE) && !nitro_is_trap_set(vcpu->kvm, NITRO_TRAP_SYSCALL))
+	// Previously emulated_ud, but we expect this for HyDE!
 
 	ops->get_msr(ctxt, MSR_STAR, &msr_data);
 	msr_data >>= 48;
 
-	//setup code segment, atleast what is left to do.
+	//setup code segment, at least what is left to do.
 	//setup_syscalls_segments does most of the work for us
-	if (ctxt->mode == X86EMUL_MODE_PROT64){ //if longmode
-	  cs_sel = (u16)((msr_data + 0x10) | 0x3);
-	  cs.l = 1;
-	  cs.d = 0;
-	}
-	else{
-	  cs_sel = (u16)(msr_data | 0x3);
-	  cs.l = 0;
-	  cs.d = 1;
+	if (mode == X86EMUL_MODE_PROT64) { //if longmode
+		cs_sel = (u16)((msr_data + 0x10) | 0x3);
+		cs.l = 1;
+		cs.d = 0;
+	} else {
+		cs_sel = (u16)(msr_data | 0x3);
+		cs.l = 0;
+		cs.d = 1;
 	}
 	cs.dpl = 0x3;
 
-	//setup stack segment, atleast what is left to do.
+	//setup stack segment, at least what is left to do.
 	//setup_syscalls_segments does most of the work for us
 	ss_sel = (u16)((msr_data + 0x8) | 0x3);
 	ss.dpl = 0x3;
@@ -2530,17 +2553,18 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
 	ctxt->eflags = (reg_read(ctxt, VCPU_REGS_R11) & 0x3c7fd7) | 0x2;
 	ctxt->_eip = reg_read(ctxt, VCPU_REGS_RCX);
 
-  // At the end so we can make modifications which won't get undone
-  if (hyde_sysret) {
-    struct kvm_vcpu *vcpu = ctxt->vcpu;
-	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
+	// At the end so we can make modifications which won't get undone
+
+#ifdef PASS_SYSCALLS_TO_USERSPACE
+	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
     // We store information in vcpu->run which is shared with userspace
     // For every syscall we provide sysno, pc, asid, direction
-    vcpu->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval
-    vcpu->run->papr_hcall.args[0] = ctxt->_eip;
-    vcpu->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
-    vcpu->run->papr_hcall.args[2] = 0; // 0: is sysret, not syscall
-  }
+    KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval
+    KVM_VCPU(ctxt)->run->papr_hcall.args[0] = ctxt->_eip;
+    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
+    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = 0; // 0: is sysret, not syscall
+#endif
+
 	return X86EMUL_CONTINUE;
 }
 
