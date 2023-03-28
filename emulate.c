@@ -2395,20 +2395,18 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	u64 msr_data;
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
-	u64 rip = ctxt->_eip; // This is important (it's next PC): we pass it to qemu which gives it to capabilities
+	u64 rip = ctxt->_eip; // next PC - passed to qemu
 	unsigned long int orig_rcx;
 #ifdef CONFIG_X86_64
-		unsigned long int orig_r11;
+	unsigned long int orig_r11;
 #endif
 
 	/* syscall is not available in real mode */
 	if (ctxt->mode == X86EMUL_MODE_REAL ||
 	    ctxt->mode == X86EMUL_MODE_VM86)
 		return emulate_ud(ctxt);
-
 	if (!(em_syscall_is_enabled(ctxt)))
 		return emulate_ud(ctxt);
-
 	ops->get_msr(ctxt, MSR_EFER, &efer);
 
 	setup_syscalls_segments(&cs, &ss);
@@ -2416,7 +2414,6 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	msr_data >>= 32;
 	cs_sel = (u16)(msr_data & 0xfffc);
 	ss_sel = (u16)(msr_data + 8);
-
 	if (efer & EFER_LMA) {
 		cs.d = 0;
 		cs.l = 1;
@@ -2434,7 +2431,6 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 			     ctxt->mode == X86EMUL_MODE_PROT64 ?
 			     MSR_LSTAR : MSR_CSTAR, &msr_data);
 		ctxt->_eip = msr_data;
-
 		ops->get_msr(ctxt, MSR_SYSCALL_MASK, &msr_data);
 		ctxt->eflags &= ~msr_data;
 		ctxt->eflags |= X86_EFLAGS_FIXED;
@@ -2443,11 +2439,11 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		/* legacy mode */
 		ops->get_msr(ctxt, MSR_STAR, &msr_data);
 		ctxt->_eip = (u32)msr_data;
-
 		ctxt->eflags &= ~(X86_EFLAGS_VM | X86_EFLAGS_IF);
 	}
-
 	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
+
+
 	if (!(efer & EFER_SCE)) { // This should always be true?
 		struct kvm_vcpu *vcpu = ctxt->vcpu;
 		// Inform userspace that a syscall has happened
@@ -2461,13 +2457,14 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 		vcpu->run->papr_hcall.args[0] = rip;
 		vcpu->run->papr_hcall.args[1] = ctxt->ops->get_cr(ctxt, 3);
 		vcpu->run->papr_hcall.args[2] = 1; // is_syscall (vs sysret)
-    vcpu->run->papr_hcall.args[3] = orig_rcx;
+		vcpu->run->papr_hcall.args[3] = orig_rcx;
 #ifdef CONFIG_X86_64
-    vcpu->run->papr_hcall.args[4] = orig_r11;
+		vcpu->run->papr_hcall.args[4] = orig_r11;
 #endif
-	}else {
-    printk_once(KERN_WARNING "kvm: emulated syscall when SCE bit is set. Impossible?\n");
-  }
+	} else {
+		printk_once(KERN_WARNING "kvm: emulated syscall when SCE bit is set. Impossible?\n");
+	}
+
 	return X86EMUL_CONTINUE;
 }
 
@@ -2531,12 +2528,12 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
 	ops->set_segment(ctxt, ss_sel, &ss, 0, VCPU_SREG_SS);
 
 	ctxt->eflags = (reg_read(ctxt, VCPU_REGS_R11) & 0x3c7fd7) | 0x2;
-  ctxt->_eip = reg_read(ctxt, VCPU_REGS_RCX);
+	ctxt->_eip = reg_read(ctxt, VCPU_REGS_RCX);
 
   // At the end so we can make modifications which won't get undone
   if (hyde_sysret) {
     struct kvm_vcpu *vcpu = ctxt->vcpu;
-	  kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
+	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu);
     // We store information in vcpu->run which is shared with userspace
     // For every syscall we provide sysno, pc, asid, direction
     vcpu->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval
@@ -4493,7 +4490,11 @@ static const struct opcode twobyte_table[256] = {
 	/* 0x00 - 0x0F */
 	G(0, group6), GD(0, &group7), N, N,
 	N, I(ImplicitOps | EmulateOnUD | IsBranch, em_syscall),
-	II(ImplicitOps | Priv, em_clts, clts), I(ImplicitOps | EmulateOnUD | Priv, em_sysret),
+	II(ImplicitOps | Priv, em_clts, clts),
+
+	// Do we run emulate sysret or run it natively?
+	I(ImplicitOps | EmulateOnUD | Priv, em_sysret),
+
 	DI(ImplicitOps | Priv, invd), DI(ImplicitOps | Priv, wbinvd), N, N,
 	N, D(ImplicitOps | ModRM | SrcMem | NoAccess), N, N,
 	/* 0x10 - 0x1F */
