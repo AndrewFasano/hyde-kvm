@@ -310,27 +310,29 @@ u64 __read_mostly host_xcr0;
 
 static struct kmem_cache *x86_emulator_cache;
 
-bool __read_mostly hyde_enabled = false;
-bool __read_mostly pre_hyde_efer_sce = false;
+// This could easily be higher
+#define MAX_VCPUS 16
+bool __read_mostly hyde_enabled[MAX_VCPUS] = {0};
+bool __read_mostly pre_hyde_efer_sce[MAX_VCPUS] = {0};
 
 /*
  * A client is potentially modifying the EFER register. We need to examine how the SCE bit is set
  * and if HyDE is enabled. Together with this info, we update pre_hyde_efer_sce.
  * If HyDE is enabled, we prohibit the SCE bit from being set
  */
-__u64 attempt_efer_update(__u64 efer) {
-    printk(KERN_INFO "HyDE enabled=%d, SCE=%d\n", hyde_enabled, (bool)(efer & EFER_SCE));
+__u64 attempt_efer_update(__u64 efer, int cpu_id) {
+    printk(KERN_INFO "HyDE enabled=%d, SCE=%d\n", hyde_enabled[cpu_id], (bool)(efer & EFER_SCE));
 	if (efer & EFER_SCE) {
 		// Guest wants to set SCE bit. If HyDe enabled, we block it
-		if (hyde_enabled) {
+		if (hyde_enabled[cpu_id]) {
 			efer &= ~EFER_SCE;
 		} else {
 			// If HyDE disabled we record that SCE was set
-			pre_hyde_efer_sce = true;
+			pre_hyde_efer_sce[cpu_id] = true;
 		}
-	} else if (!hyde_enabled) {
+	} else if (!hyde_enabled[cpu_id]) {
 		// Guest doesn't want to set SCE bit. If HyDE disabled, record this
-		pre_hyde_efer_sce = false;
+		pre_hyde_efer_sce[cpu_id] = false;
 	}
 	return efer;
 }
@@ -1767,7 +1769,7 @@ static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 	// If HyDE is disabled, we keep track of the state of the SCE flag so we can
 	// ensure it gets set to its old value after HyDE finishes. If we get this
 	// wrong, the guest will run slower than it should, but it shouldn't crash.
-	efer = attempt_efer_update(efer);
+	efer = attempt_efer_update(efer, vcpu->vcpu_id);
 
 	r = static_call(kvm_x86_set_efer)(vcpu, efer);
 	if (r) {
@@ -5595,11 +5597,13 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
 #define KVM_HYDE_TOGGLE 0x8001aebb
 		case KVM_HYDE_TOGGLE: {
-			printk(KERN_ERR "hyde: Lets toggle hyde from %d to %d\n", hyde_enabled, (bool)arg);
-			hyde_enabled = (bool)arg;
-			if (pre_hyde_efer_sce) {
+			printk(KERN_ERR "hyde: Lets toggle hyde from %d to %d on CPU %d\n", hyde_enabled[vcpu->vcpu_id],
+                      (bool)arg, vcpu->vcpu_id);
+
+			hyde_enabled[vcpu->vcpu_id] = (bool)arg;
+			if (pre_hyde_efer_sce[vcpu->vcpu_idx]) {
 				u64 efer = vcpu->arch.efer;
-				if (hyde_enabled) {
+				if (hyde_enabled[vcpu->vcpu_id]) {
 					// We just enabled hyde and the SCE bit was previously set so we need to disable it
 					efer &= ~EFER_SCE;
 				} else {
@@ -5608,15 +5612,15 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 				}
 				//printk(KERN_ERR "hyde: Lets kick\n");
 				//kvm_vcpu_kick(vcpu);
-				printk(KERN_ERR "hyde: Fin kick, set efer\n");
+				//printk(KERN_ERR "hyde: Fin kick, set efer\n");
 				// Kick CPU
 				r = static_call(kvm_x86_set_efer)(vcpu, efer);
 				if (r) {
 					WARN_ON(r > 0);
 				}
-				printk(KERN_ERR "hyde: All done\n");
-			}else{
-				printk(KERN_ERR "hyde: no need to change efer\n");
+				//printk(KERN_ERR "hyde: All done\n");
+			//}else{
+				//printk(KERN_ERR "hyde: no need to change efer\n");
 			}
 		r = 0;
 		break;
@@ -11403,7 +11407,7 @@ static int __set_sregs2(struct kvm_vcpu *vcpu, struct kvm_sregs2 *sregs2)
 	if (valid_pdptrs && (!pae || vcpu->arch.guest_state_protected))
 		return -EINVAL;
 
-	sregs2->efer = attempt_efer_update(sregs2->efer);
+	sregs2->efer = attempt_efer_update(sregs2->efer, vcpu->vcpu_id);
 
 	ret = __set_sregs_common(vcpu, (struct kvm_sregs *)sregs2,
 				 &mmu_reset_needed, !valid_pdptrs);
@@ -12197,10 +12201,10 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 	if (ret)
 		goto out_uninit_mmu;
 
-	// XXX should make this per-vcpu or per guest system
+	// Should make these per-guest
 	printk(KERN_INFO "HyDE init, disable opts\n");
-	hyde_enabled = false;
-	pre_hyde_efer_sce = false;
+  memset(hyde_enabled, 0, sizeof(hyde_enabled));
+  memset(pre_hyde_efer_sce, 0, sizeof(hyde_enabled));
 
 	INIT_HLIST_HEAD(&kvm->arch.mask_notifier_list);
 	INIT_LIST_HEAD(&kvm->arch.assigned_dev_head);
