@@ -2403,7 +2403,7 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
 	int mode = ctxt->mode;
 	bool is_lma;
 #ifdef PASS_SYSCALLS_TO_USERSPACE
-	struct kvm_segment fs;
+	//struct kvm_segment fs;
 	u64 rip = ctxt->_eip; // next PC - passed to qemu
 	unsigned long int orig_rcx;
 	unsigned long int orig_r11;
@@ -2474,38 +2474,28 @@ orig_r11 = 0
 	// We make this request here and then x86.c will detect it at :9709.
 
 	// We store information in vcpu->run which is shared with userspace
-	// For every syscall we provide sysno, pc, asid, direction
 
-	// NR: retval
-	KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX);
+    // NR: retval
+    KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX);
 
- 	// 0: bool, is_syscall (true)
-	KVM_VCPU(ctxt)->run->papr_hcall.args[0] = 1;
+    // 0: bool, is_syscall (true)
+    KVM_VCPU(ctxt)->run->papr_hcall.args[0] = 1;
 
- 	//1: cpu index
-	KVM_VCPU(ctxt)->run->papr_hcall.args[1] = KVM_VCPU(ctxt)->vcpu_id;
+    // 1: PC
+    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = rip;
 
- 	// 2: CR3 (ASID)
-	KVM_VCPU(ctxt)->run->papr_hcall.args[2] = ctxt->ops->get_cr(ctxt, 3);
+    // 2: R12
+    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = reg_read(ctxt, VCPU_REGS_R12);
 
-	// 3: fs base (to distinguish between threads)
-	kvm_get_segment(KVM_VCPU(ctxt), &fs, VCPU_SREG_FS);
-	KVM_VCPU(ctxt)->run->papr_hcall.args[3] = fs.base;
+    // 3: R13
+    KVM_VCPU(ctxt)->run->papr_hcall.args[3] = reg_read(ctxt, VCPU_REGS_R13);
 
-	// 4: PC
-	KVM_VCPU(ctxt)->run->papr_hcall.args[4] = rip;
+    // 4: R14
+    KVM_VCPU(ctxt)->run->papr_hcall.args[4] =  reg_read(ctxt, VCPU_REGS_R14); // Not redundant here
 
- 	// 5: orig_rcx
-	KVM_VCPU(ctxt)->run->papr_hcall.args[5] = orig_rcx;
+    // 5: R15
+    KVM_VCPU(ctxt)->run->papr_hcall.args[5] = reg_read(ctxt, VCPU_REGS_R15);
 
-	// 6: orig_r11
-	KVM_VCPU(ctxt)->run->papr_hcall.args[6] = orig_r11;
-
-	// 7: r14
-	KVM_VCPU(ctxt)->run->papr_hcall.args[7] = reg_read(ctxt, VCPU_REGS_R14);
-
-  // 8: r15
-	KVM_VCPU(ctxt)->run->papr_hcall.args[8] = reg_read(ctxt, VCPU_REGS_R15);
 
 	// Note that QEMU KVM used to ignore the TPR_ACCESS error, so that's why we co-opted it
 	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
@@ -2527,7 +2517,7 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
 	u16 cs_sel, ss_sel;
 	u64 efer = 0;
 #ifdef PASS_SYSCALLS_TO_USERSPACE
-	struct kvm_segment fs;
+	//struct kvm_segment fs;
   unsigned long int r14;
 #endif
 	int mode = ctxt->mode;
@@ -2590,36 +2580,34 @@ static int em_sysret(struct x86_emulate_ctxt *ctxt)
     // Only notify userspace when R14 matches magic value with invalid eflags.
     // otherwise userspace can't care
   r14 = reg_read(ctxt, VCPU_REGS_R14);
-  if (r14 == 0xdeadbeef /*&& (ctxt->eflags & 0x2) == 0 */) {
+  if (r14 == 0xdeadbeef) {
     // We store information in vcpu->run which is shared with userspace
-    // For every syscall we provide sysno, pc, asid, direction
+    // NR: retval
     KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval
+  
+    // Unused fields we might want to bring back later?
+    // cpu_id: KVM_VCPU(ctxt)->vcpu_id;
+    // cr3: ctxt->ops->get_cr(ctxt, 3);
+    // fs_base: kvm_get_segment(KVM_VCPU(ctxt), &fs, VCPU_SREG_FS); fs.base;
+    // rsp: reg_read(ctxt, VCPU_REGS_RSP);
 
-    // 0: bool, is_sycall (false)
+    // 0: bool, is_sycall (false, this is sysret)
     KVM_VCPU(ctxt)->run->papr_hcall.args[0] = 0;
 
-    // 1: vcpu_id. Note we could mask and marge with is_sysret
-    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = KVM_VCPU(ctxt)->vcpu_id;
+    // 1: PC
+    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = ctxt->_eip;
 
-    // 2: CR3 (ASID)
-    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = ctxt->ops->get_cr(ctxt, 3);
+    // 2: R12
+    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = reg_read(ctxt, VCPU_REGS_R12);
 
-    // 3: fs base (to distinguish between threads)
-    kvm_get_segment(KVM_VCPU(ctxt), &fs, VCPU_SREG_FS);
-    KVM_VCPU(ctxt)->run->papr_hcall.args[3] = fs.base;
+    // 3: R13
+    KVM_VCPU(ctxt)->run->papr_hcall.args[3] = reg_read(ctxt, VCPU_REGS_R13);
 
-    // 4: PC
-    KVM_VCPU(ctxt)->run->papr_hcall.args[4] = ctxt->_eip;
+    // 4: R14
+    KVM_VCPU(ctxt)->run->papr_hcall.args[4] = r14; // XXX kinda redundant, we only call with r14 = this
 
-    // 7: rsp
-    //KVM_VCPU(ctxt)->run->papr_hcall.args[7] = reg_read(ctxt, VCPU_REGS_RSP);
-
-    // 5: r14
-    KVM_VCPU(ctxt)->run->papr_hcall.args[7] = r14;
-
-    // 6: r15
-    KVM_VCPU(ctxt)->run->papr_hcall.args[8] = reg_read(ctxt, VCPU_REGS_R15);
-
+    // 5: R15
+    KVM_VCPU(ctxt)->run->papr_hcall.args[5] = reg_read(ctxt, VCPU_REGS_R15);
 
     kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
     }
