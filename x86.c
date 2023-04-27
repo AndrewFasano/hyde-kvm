@@ -5597,7 +5597,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
 #define KVM_HYDE_TOGGLE 0x8001aebb
 		case KVM_HYDE_TOGGLE: {
-			printk(KERN_ERR "hyde: Lets toggle hyde from %d to %d on CPU %d\n", hyde_enabled[vcpu->vcpu_id],
+			printk(KERN_ERR "hyde: Let's toggle hyde from %d to %d on CPU %d\n", hyde_enabled[vcpu->vcpu_id],
                       (bool)arg, vcpu->vcpu_id);
 
 			hyde_enabled[vcpu->vcpu_id] = (bool)arg;
@@ -5611,7 +5611,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 					efer |= EFER_SCE;
 				}
 				//printk(KERN_ERR "hyde: Lets kick\n");
-				//kvm_vcpu_kick(vcpu);
+				kvm_vcpu_kick(vcpu); // XXX do we want this?
 				//printk(KERN_ERR "hyde: Fin kick, set efer\n");
 				// Kick CPU
 				r = static_call(kvm_x86_set_efer)(vcpu, efer);
