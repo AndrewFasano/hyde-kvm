@@ -1,4 +1,4 @@
-# Hypervisor Dissociative Execution (HyDE) Kernel Virtual Machine (KVM)
+# Hypervisor Dissociative Execution (HyDE) Kernel-based Virtual Machine (KVM)
 
 HyDE (Hypervisor Dissociative Execution) is an innovative, modified virtualization environment that empowers the host system to inject system calls into a guest virtual machine, enabling advanced control and monitoring of guest behavior. This repository contains the customized Linux KVM (Kernel-based Virtual Machine) logic essential for implementing HyDE.
 
@@ -7,9 +7,9 @@ This repository contains the customized Linux KVM logic for HyDE. The `kvm` dire
 A build helper is provided to build a 6.2.2 kernel with these changes, just run `./build_with_docker.sh` and follow the instructions to install the kernel that is built.
 
 ## Repositories
-- [HyDE KVM](#) This repo: Contains the customized Linux KVM logic for HyDE.
-- [HyDE QEMU](https://github.com/AndrewFasano/hhyde-qemu) Customized QEMU for HyDE.
-- [HyDE Capabilities](https://github.com/AndrewFasano/hhyde-capabilities) HyDE SDK and examples.
+- [HyDE Core](https://github.com/AndrewFasano/hyde-capabilities): HyDE SDK, examples, and documentation.
+- [HyDE KVM](https://github.com/AndrewFasano/hyde-kvm): Customized Linux KVM logic for HyDE.
+- [HyDE QEMU](https://github.com/AndrewFasano/hyde-qemu) Customized QEMU for HyDE.
 
 ## License
 As described in the COPYING file, this repository is licensed under the GNU General Public License version 2.
