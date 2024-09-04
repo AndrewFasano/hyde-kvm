@@ -1,0 +1,477 @@
+diff --git a/Makefile b/Makefile
+index 80e3fe1..e9ddc15 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ ccflags-y += -I $(srctree)/arch/x86/kvm
+-ccflags-$(CONFIG_KVM_WERROR) += -Werror
++ccflags-$(CONFIG_KVM_WERROR) += -Werror -O2
+ 
+ ifeq ($(CONFIG_FRAME_POINTER),y)
+ OBJECT_FILES_NON_STANDARD_vmenter.o := y
+diff --git a/emulate.c b/emulate.c
+index 5cc3efa..ee61662 100644
+--- a/emulate.c
++++ b/emulate.c
+@@ -18,6 +18,9 @@
+  * From: xen-unstable 10676:af9809f51f81a3c43f276f00c81a52ef558afda4
+  */
+ 
++ // For performance testing - do we tell userspace about syscalls?
++#define PASS_SYSCALLS_TO_USERSPACE
++
+ #include <linux/kvm_host.h>
+ #include "kvm_cache_regs.h"
+ #include "kvm_emulate.h"
+@@ -2388,6 +2391,8 @@ static bool em_syscall_is_enabled(struct x86_emulate_ctxt *ctxt)
+ 	return false;
+ }
+ 
++
++#define KVM_VCPU(ctxt) ((struct kvm_vcpu *)ctxt->vcpu)
+ static int em_syscall(struct x86_emulate_ctxt *ctxt)
+ {
+ 	const struct x86_emulate_ops *ops = ctxt->ops;
+@@ -2395,58 +2400,223 @@ static int em_syscall(struct x86_emulate_ctxt *ctxt)
+ 	u64 msr_data;
+ 	u16 cs_sel, ss_sel;
+ 	u64 efer = 0;
++	int mode = ctxt->mode;
++	bool is_lma;
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++	//struct kvm_segment fs;
++	u64 rip = ctxt->_eip; // next PC - passed to qemu
++	unsigned long int orig_rcx;
++	unsigned long int orig_r11;
++#endif
+ 
+ 	/* syscall is not available in real mode */
+-	if (ctxt->mode == X86EMUL_MODE_REAL ||
+-	    ctxt->mode == X86EMUL_MODE_VM86)
++	if (unlikely(mode == X86EMUL_MODE_REAL ||
++				 mode == X86EMUL_MODE_VM86))
+ 		return emulate_ud(ctxt);
+ 
+-	if (!(em_syscall_is_enabled(ctxt)))
++	if (unlikely(!em_syscall_is_enabled(ctxt)))
+ 		return emulate_ud(ctxt);
+ 
+ 	ops->get_msr(ctxt, MSR_EFER, &efer);
+-	if (!(efer & EFER_SCE))
+-		return emulate_ud(ctxt);
++	//if (unlikely(!(efer & EFER_SCE)))
++	//	return emulate_ud(ctxt);
+ 
+ 	setup_syscalls_segments(&cs, &ss);
++
+ 	ops->get_msr(ctxt, MSR_STAR, &msr_data);
+ 	msr_data >>= 32;
+ 	cs_sel = (u16)(msr_data & 0xfffc);
+ 	ss_sel = (u16)(msr_data + 8);
+ 
+-	if (efer & EFER_LMA) {
++	is_lma = efer & EFER_LMA;
++	if (is_lma) {
+ 		cs.d = 0;
+ 		cs.l = 1;
+ 	}
++
+ 	ops->set_segment(ctxt, cs_sel, &cs, 0, VCPU_SREG_CS);
+ 	ops->set_segment(ctxt, ss_sel, &ss, 0, VCPU_SREG_SS);
+ 
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++	orig_rcx = reg_read(ctxt, VCPU_REGS_RCX); // Save orig RCX
++#endif
+ 	*reg_write(ctxt, VCPU_REGS_RCX) = ctxt->_eip;
+-	if (efer & EFER_LMA) {
++
++	if (is_lma) {
+ #ifdef CONFIG_X86_64
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++		orig_r11 = reg_read(ctxt, VCPU_REGS_R11); // Save orig R11
++#endif
+ 		*reg_write(ctxt, VCPU_REGS_R11) = ctxt->eflags;
+-
+ 		ops->get_msr(ctxt,
+-			     ctxt->mode == X86EMUL_MODE_PROT64 ?
+-			     MSR_LSTAR : MSR_CSTAR, &msr_data);
++				mode == X86EMUL_MODE_PROT64 ?
++				MSR_LSTAR : MSR_CSTAR, &msr_data);
+ 		ctxt->_eip = msr_data;
+-
+ 		ops->get_msr(ctxt, MSR_SYSCALL_MASK, &msr_data);
+ 		ctxt->eflags &= ~msr_data;
+ 		ctxt->eflags |= X86_EFLAGS_FIXED;
++#else
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++orig_r11 = 0
++#endif
+ #endif
+ 	} else {
+ 		/* legacy mode */
+ 		ops->get_msr(ctxt, MSR_STAR, &msr_data);
+ 		ctxt->_eip = (u32)msr_data;
+-
+ 		ctxt->eflags &= ~(X86_EFLAGS_VM | X86_EFLAGS_IF);
+ 	}
+ 
+ 	ctxt->tf = (ctxt->eflags & X86_EFLAGS_TF) != 0;
++
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++	// Inform userspace that a syscall has happened
++	// We make this request here and then x86.c will detect it at :9709.
++
++	// We store information in vcpu->run which is shared with userspace
++
++    // NR: retval
++    KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX);
++
++    // 0: bool, is_syscall (true)
++    KVM_VCPU(ctxt)->run->papr_hcall.args[0] = 1;
++
++    // 1: PC
++    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = rip;
++
++    // 2: R12
++    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = reg_read(ctxt, VCPU_REGS_R12);
++
++    // 3: R13
++    KVM_VCPU(ctxt)->run->papr_hcall.args[3] = reg_read(ctxt, VCPU_REGS_R13);
++
++    // 4: R14
++    KVM_VCPU(ctxt)->run->papr_hcall.args[4] =  reg_read(ctxt, VCPU_REGS_R14); // Not redundant here
++
++    // 5: R15
++    KVM_VCPU(ctxt)->run->papr_hcall.args[5] = reg_read(ctxt, VCPU_REGS_R15);
++
++
++	// Note that QEMU KVM used to ignore the TPR_ACCESS error, so that's why we co-opted it
++	kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
++
++#endif
++
+ 	return X86EMUL_CONTINUE;
+ }
+ 
++static int em_sysret(struct x86_emulate_ctxt *ctxt)
++{
++	// Function based off kvm-vmi/nitro code from
++	// https://github.com/KVM-VMI/kvm/blob/master/arch/x86/kvm/emulate.c#L2693
++	// Slight optimizations from GPT4
++
++	const struct x86_emulate_ops *ops = ctxt->ops;
++	struct desc_struct cs, ss;
++	u64 msr_data, rcx;
++	u16 cs_sel, ss_sel;
++	u64 efer = 0;
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++	//struct kvm_segment fs;
++  unsigned long int r14;
++#endif
++	int mode = ctxt->mode;
++	//struct kvm_vcpu *vcpu = container_of(ctxt, struct kvm_vcpu, arch.emulate_ctxt);
++
++	/* syscall is not available in real mode */
++	if (unlikely(mode == X86EMUL_MODE_REAL ||
++				 mode == X86EMUL_MODE_VM86))
++		return emulate_ud(ctxt);
++	if (unlikely(!em_syscall_is_enabled(ctxt)))
++		return emulate_ud(ctxt);
++
++	if (unlikely(ctxt->ops->cpl(ctxt) != 0)) {
++		return emulate_gp(ctxt, 0);
++	}
++
++	//check if RCX is in canonical form
++	rcx = reg_read(ctxt, VCPU_REGS_RCX);
++	if (((rcx & 0xFFFF800000000000) != 0xFFFF800000000000) &&
++	    ((rcx & 0x00007FFFFFFFFFFF) != rcx)) {
++		return emulate_gp(ctxt, 0);
++	}
++
++	ops->get_msr(ctxt, MSR_EFER, &efer);
++	setup_syscalls_segments(&cs, &ss);
++
++	//if (!(efer & EFER_SCE) && !nitro_is_trap_set(vcpu->kvm, NITRO_TRAP_SYSCALL))
++	// Previously emulated_ud, but we expect this for HyDE!
++
++	ops->get_msr(ctxt, MSR_STAR, &msr_data);
++	msr_data >>= 48;
++
++	//setup code segment, at least what is left to do.
++	//setup_syscalls_segments does most of the work for us
++	if (mode == X86EMUL_MODE_PROT64) { //if longmode
++		cs_sel = (u16)((msr_data + 0x10) | 0x3);
++		cs.l = 1;
++		cs.d = 0;
++	} else {
++		cs_sel = (u16)(msr_data | 0x3);
++		cs.l = 0;
++		cs.d = 1;
++	}
++	cs.dpl = 0x3;
++
++	//setup stack segment, at least what is left to do.
++	//setup_syscalls_segments does most of the work for us
++	ss_sel = (u16)((msr_data + 0x8) | 0x3);
++	ss.dpl = 0x3;
++
++	ops->set_segment(ctxt, cs_sel, &cs, 0, VCPU_SREG_CS);
++	ops->set_segment(ctxt, ss_sel, &ss, 0, VCPU_SREG_SS);
++
++	ctxt->eflags = (reg_read(ctxt, VCPU_REGS_R11) & 0x3c7fd7) | 0x2;
++	ctxt->_eip = reg_read(ctxt, VCPU_REGS_RCX);
++
++	// At the end so we can make modifications which won't get undone
++
++#ifdef PASS_SYSCALLS_TO_USERSPACE
++    // Only notify userspace when R14 matches magic value with invalid eflags.
++    // otherwise userspace can't care
++  r14 = reg_read(ctxt, VCPU_REGS_R14);
++  if (r14 == 0xdeadbeef) {
++    // We store information in vcpu->run which is shared with userspace
++    // NR: retval
++    KVM_VCPU(ctxt)->run->papr_hcall.nr = reg_read(ctxt, VCPU_REGS_RAX); // Retval
++  
++    // Unused fields we might want to bring back later?
++    // cpu_id: KVM_VCPU(ctxt)->vcpu_id;
++    // cr3: ctxt->ops->get_cr(ctxt, 3);
++    // fs_base: kvm_get_segment(KVM_VCPU(ctxt), &fs, VCPU_SREG_FS); fs.base;
++    // rsp: reg_read(ctxt, VCPU_REGS_RSP);
++
++    // 0: bool, is_sycall (false, this is sysret)
++    KVM_VCPU(ctxt)->run->papr_hcall.args[0] = 0;
++
++    // 1: PC
++    KVM_VCPU(ctxt)->run->papr_hcall.args[1] = ctxt->_eip;
++
++    // 2: R12
++    KVM_VCPU(ctxt)->run->papr_hcall.args[2] = reg_read(ctxt, VCPU_REGS_R12);
++
++    // 3: R13
++    KVM_VCPU(ctxt)->run->papr_hcall.args[3] = reg_read(ctxt, VCPU_REGS_R13);
++
++    // 4: R14
++    KVM_VCPU(ctxt)->run->papr_hcall.args[4] = r14; // XXX kinda redundant, we only call with r14 = this
++
++    // 5: R15
++    KVM_VCPU(ctxt)->run->papr_hcall.args[5] = reg_read(ctxt, VCPU_REGS_R15);
++
++    kvm_make_request(KVM_REQ_REPORT_TPR_ACCESS, KVM_VCPU(ctxt));
++    }
++#endif
++
++	return X86EMUL_CONTINUE;
++}
++
++
+ static int em_sysenter(struct x86_emulate_ctxt *ctxt)
+ {
+ 	const struct x86_emulate_ops *ops = ctxt->ops;
+@@ -4392,7 +4562,11 @@ static const struct opcode twobyte_table[256] = {
+ 	/* 0x00 - 0x0F */
+ 	G(0, group6), GD(0, &group7), N, N,
+ 	N, I(ImplicitOps | EmulateOnUD | IsBranch, em_syscall),
+-	II(ImplicitOps | Priv, em_clts, clts), N,
++	II(ImplicitOps | Priv, em_clts, clts),
++
++	// Do we run emulate sysret or run it natively?
++	I(ImplicitOps | EmulateOnUD | Priv, em_sysret),
++
+ 	DI(ImplicitOps | Priv, invd), DI(ImplicitOps | Priv, wbinvd), N, N,
+ 	N, D(ImplicitOps | ModRM | SrcMem | NoAccess), N, N,
+ 	/* 0x10 - 0x1F */
+diff --git a/x86.c b/x86.c
+index a2c299d..29ff303 100644
+--- a/x86.c
++++ b/x86.c
+@@ -310,6 +310,34 @@ u64 __read_mostly host_xcr0;
+ 
+ static struct kmem_cache *x86_emulator_cache;
+ 
++// This could easily be higher
++#define MAX_VCPUS 16
++bool __read_mostly hyde_enabled[MAX_VCPUS] = {0};
++bool __read_mostly pre_hyde_efer_sce[MAX_VCPUS] = {0};
++
++/*
++ * A client is potentially modifying the EFER register. We need to examine how the SCE bit is set
++ * and if HyDE is enabled. Together with this info, we update pre_hyde_efer_sce.
++ * If HyDE is enabled, we prohibit the SCE bit from being set
++ */
++__u64 attempt_efer_update(__u64 efer, int cpu_id) {
++    printk(KERN_INFO "HyDE enabled=%d, SCE=%d\n", hyde_enabled[cpu_id], (bool)(efer & EFER_SCE));
++	if (efer & EFER_SCE) {
++		// Guest wants to set SCE bit. If HyDe enabled, we block it
++		if (hyde_enabled[cpu_id]) {
++			efer &= ~EFER_SCE;
++		} else {
++			// If HyDE disabled we record that SCE was set
++			pre_hyde_efer_sce[cpu_id] = true;
++		}
++	} else if (!hyde_enabled[cpu_id]) {
++		// Guest doesn't want to set SCE bit. If HyDE disabled, record this
++		pre_hyde_efer_sce[cpu_id] = false;
++	}
++	return efer;
++}
++
++
+ /*
+  * When called, it means the previous get/set msr reached an invalid msr.
+  * Return true if we want to ignore/silent this failed msr access.
+@@ -1735,6 +1763,14 @@ static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	efer &= ~EFER_LMA;
+ 	efer |= vcpu->arch.efer & EFER_LMA;
+ 
++	// If HyDE is enabled, we don't let the guest set the SCE bit. When this
++	// bit is unset, we'll trap on undefined instruction when we hit syscall/sysret
++	// allowing us to emulate those instructions but also to coopt them with HyDE.
++	// If HyDE is disabled, we keep track of the state of the SCE flag so we can
++	// ensure it gets set to its old value after HyDE finishes. If we get this
++	// wrong, the guest will run slower than it should, but it shouldn't crash.
++	efer = attempt_efer_update(efer, vcpu->vcpu_id);
++
+ 	r = static_call(kvm_x86_set_efer)(vcpu, efer);
+ 	if (r) {
+ 		WARN_ON(r > 0);
+@@ -4097,7 +4133,7 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		msr_info->data |= (((uint64_t)4ULL) << 40);
+ 		break;
+ 	case MSR_EFER:
+-		msr_info->data = vcpu->arch.efer;
++		msr_info->data = vcpu->arch.efer; /* HyDE TODO: should we hide the SCE bit we changed? */
+ 		break;
+ 	case MSR_KVM_WALL_CLOCK:
+ 		if (!guest_pv_has(vcpu, KVM_FEATURE_CLOCKSOURCE))
+@@ -5555,6 +5591,40 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 
+ 	u.buffer = NULL;
+ 	switch (ioctl) {
++	// This should be defined in include/uapi/linux/kvm.h
++  // But to keep our patches isolated, we can just define it here and add
++  // a matching def to qemu
++	//#define KVM_HYDE_TOGGLE      _IOR(KVMIO,   0xbb, bool)
++#define KVM_HYDE_TOGGLE 0x8001aebb
++		case KVM_HYDE_TOGGLE: {
++			printk(KERN_ERR "hyde: Let's toggle hyde from %d to %d on CPU %d\n", hyde_enabled[vcpu->vcpu_id],
++                      (bool)arg, vcpu->vcpu_id);
++
++			hyde_enabled[vcpu->vcpu_id] = (bool)arg;
++			if (pre_hyde_efer_sce[vcpu->vcpu_idx]) {
++				u64 efer = vcpu->arch.efer;
++				if (hyde_enabled[vcpu->vcpu_id]) {
++					// We just enabled hyde and the SCE bit was previously set so we need to disable it
++					efer &= ~EFER_SCE;
++				} else {
++					// We just disabled hyde, but we previously had SCE on. Turn it back on!
++					efer |= EFER_SCE;
++				}
++				//printk(KERN_ERR "hyde: Lets kick\n");
++				kvm_vcpu_kick(vcpu); // XXX do we want this?
++				//printk(KERN_ERR "hyde: Fin kick, set efer\n");
++				// Kick CPU
++				r = static_call(kvm_x86_set_efer)(vcpu, efer);
++				if (r) {
++					WARN_ON(r > 0);
++				}
++				//printk(KERN_ERR "hyde: All done\n");
++			//}else{
++				//printk(KERN_ERR "hyde: no need to change efer\n");
++			}
++		r = 0;
++		break;
++	}
+ 	case KVM_GET_LAPIC: {
+ 		r = -EINVAL;
+ 		if (!lapic_in_kernel(vcpu))
+@@ -8537,6 +8607,10 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
+ 	 * and the address again, we can break out of the potential infinite
+ 	 * loop.
+ 	 */
++
++	// TODO: could we do our HyDE fualt here if we returned retry in emulate.c
++	// and set some shared state? Then maybe we could retry after trapping to host?
++
+ 	vcpu->arch.last_retry_eip = vcpu->arch.last_retry_addr = 0;
+ 
+ 	if (!(emulation_type & EMULTYPE_ALLOW_RETRY_PF))
+@@ -10297,6 +10371,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			kvm_vcpu_flush_tlb_guest(vcpu);
+ 
+ 		if (kvm_check_request(KVM_REQ_REPORT_TPR_ACCESS, vcpu)) {
++			//assert(is_syscall);
+ 			vcpu->run->exit_reason = KVM_EXIT_TPR_ACCESS;
+ 			r = 0;
+ 			goto out;
+@@ -10690,6 +10765,7 @@ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+ /* Called within kvm->srcu read side.  */
+ static int vcpu_run(struct kvm_vcpu *vcpu)
+ {
++	// called by kvm_arch_vcpu_ioctl_run in emulation loop
+ 	int r;
+ 
+ 	vcpu->arch.l1tf_flush_l1d = true;
+@@ -10703,7 +10779,7 @@ static int vcpu_run(struct kvm_vcpu *vcpu)
+ 		 */
+ 		vcpu->arch.at_instruction_boundary = false;
+ 		if (kvm_vcpu_running(vcpu)) {
+-			r = vcpu_enter_guest(vcpu);
++			r = vcpu_enter_guest(vcpu); // This is where we check for the is_syscall
+ 		} else {
+ 			r = vcpu_block(vcpu);
+ 		}
+@@ -10831,6 +10907,7 @@ static void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
+ 
+ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ {
++	// Main function run by kvm_main in a loop for each VM_RUN ioctl issued by userspace
+ 	struct kvm_queued_exception *ex = &vcpu->arch.exception;
+ 	struct kvm_run *kvm_run = vcpu->run;
+ 	int r;
+@@ -10922,9 +10999,10 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 
+ 	r = static_call(kvm_x86_vcpu_pre_run)(vcpu);
+ 	if (r <= 0)
+-		goto out;
++		goto out; /* HyDE XXX: if this bails on emulated syscall injection we'll have problems */
+ 
+-	r = vcpu_run(vcpu);
++	r = vcpu_run(vcpu); // This is the main emu call which eventually checks for is_syscall
++		                    // vcpu_run -> vcpu_enter_guest
+ 
+ out:
+ 	kvm_put_guest_fpu(vcpu);
+@@ -11329,6 +11407,8 @@ static int __set_sregs2(struct kvm_vcpu *vcpu, struct kvm_sregs2 *sregs2)
+ 	if (valid_pdptrs && (!pae || vcpu->arch.guest_state_protected))
+ 		return -EINVAL;
+ 
++	sregs2->efer = attempt_efer_update(sregs2->efer, vcpu->vcpu_id);
++
+ 	ret = __set_sregs_common(vcpu, (struct kvm_sregs *)sregs2,
+ 				 &mmu_reset_needed, !valid_pdptrs);
+ 	if (ret)
+@@ -12121,6 +12201,11 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	if (ret)
+ 		goto out_uninit_mmu;
+ 
++	// Should make these per-guest
++	printk(KERN_INFO "HyDE init, disable opts\n");
++  memset(hyde_enabled, 0, sizeof(hyde_enabled));
++  memset(pre_hyde_efer_sce, 0, sizeof(hyde_enabled));
++
+ 	INIT_HLIST_HEAD(&kvm->arch.mask_notifier_list);
+ 	INIT_LIST_HEAD(&kvm->arch.assigned_dev_head);
+ 	atomic_set(&kvm->arch.noncoherent_dma_count, 0);
+diff --git a/x86.h b/x86.h
+index 9de7258..dee4fb2 100644
+--- a/x86.h
++++ b/x86.h
+@@ -485,5 +485,4 @@ int kvm_sev_es_mmio_read(struct kvm_vcpu *vcpu, gpa_t src, unsigned int bytes,
+ int kvm_sev_es_string_io(struct kvm_vcpu *vcpu, unsigned int size,
+ 			 unsigned int port, void *data,  unsigned int count,
+ 			 int in);
+-
+ #endif
